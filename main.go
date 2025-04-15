@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"image"
+	"image/color"
 	"image/png"
 	"log"
 	"math"
@@ -14,20 +16,28 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
 const (
-	minZoom       = 0
-	maxZoom       = 18
-	tileSize      = 256
-	tileResultBuf = 64
-	yourUserAgent = "MyFyneMapApp/0.1 (contact@example.com)"
+	minZoom         = 0
+	maxZoom         = 18
+	tileSize        = 256
+	tileResultBuf   = 64
+	yourUserAgent   = "MyFyneMapApp/0.2 (contact@example.com)"
+	markerRadius    = 5    // Pixel radius for the marker circle
+	markerHitRadius = 10.0 // Pixel radius for click detection
+	fetchTimeout    = 15 * time.Second
+	sendTimeout     = 5 * time.Second
 )
 
-var cartoSubdomains = []string{"a", "b", "c", "d"}
+var (
+	cartoSubdomains = []string{"a", "b", "c", "d"}
+	markerColor     = color.NRGBA{R: 0, G: 0, B: 255, A: 255} // Blue
+	httpClient      = &http.Client{Timeout: fetchTimeout}
+)
 
 type TileCoord struct {
 	Z, X, Y int
@@ -37,6 +47,13 @@ type TileResult struct {
 	Coord TileCoord
 	Image image.Image
 	Error error
+}
+
+type MapMarker struct {
+	ID   string
+	Lat  float64
+	Lon  float64
+	Name string
 }
 
 type TileMapWidget struct {
@@ -52,9 +69,11 @@ type TileMapWidget struct {
 	tileFetching   map[TileCoord]bool
 	resultChan     chan TileResult
 	stopChan       chan struct{}
+	markers        []*MapMarker
+	parentWindow   fyne.Window
 }
 
-func NewTileMapWidget(startZoom int, startLat, startLon float64) *TileMapWidget {
+func NewTileMapWidget(startZoom int, startLat, startLon float64, parentWin fyne.Window) *TileMapWidget {
 	m := &TileMapWidget{
 		zoom:           startZoom,
 		centerLat:      startLat,
@@ -63,17 +82,59 @@ func NewTileMapWidget(startZoom int, startLat, startLon float64) *TileMapWidget 
 		tileFetching:   make(map[TileCoord]bool),
 		resultChan:     make(chan TileResult, tileResultBuf),
 		stopChan:       make(chan struct{}),
+		markers:        make([]*MapMarker, 0),
+		parentWindow:   parentWin,
 	}
 	m.ExtendBaseWidget(m)
 	return m
 }
 
-func (m *TileMapWidget) CreateRenderer() fyne.WidgetRenderer {
-	r := &tileMapRenderer{
-		mapWidget:   m,
-		canvasTiles: make(map[TileCoord]*canvas.Image),
+func (m *TileMapWidget) AddMarker(marker *MapMarker) {
+	if marker == nil {
+		return
 	}
-	return r
+	m.mu.Lock()
+	m.markers = append(m.markers, marker)
+	m.mu.Unlock()
+	m.Refresh()
+}
+
+func (m *TileMapWidget) latLonToScreenXY(markerLat, markerLon float64) (float32, float32) {
+	m.mu.RLock()
+	zoom := m.zoom
+	centerLat := m.centerLat
+	centerLon := m.centerLon
+	w := m.width
+	h := m.height
+	m.mu.RUnlock()
+
+	if w <= 0 || h <= 0 {
+		return -1, -1
+	}
+
+	n := math.Pow(2.0, float64(zoom))
+
+	markerPxX := ((markerLon + 180.0) / 360.0) * n * tileSize
+	markerPxY := (1.0 - math.Log(math.Tan(markerLat*math.Pi/180.0)+1.0/math.Cos(markerLat*math.Pi/180.0))/math.Pi) / 2.0 * n * tileSize
+
+	centerPxX := ((centerLon + 180.0) / 360.0) * n * tileSize
+	centerPxY := (1.0 - math.Log(math.Tan(centerLat*math.Pi/180.0)+1.0/math.Cos(centerLat*math.Pi/180.0))/math.Pi) / 2.0 * n * tileSize
+
+	offsetX := markerPxX - centerPxX
+	offsetY := markerPxY - centerPxY
+
+	screenX := (w / 2.0) + float32(offsetX)
+	screenY := (h / 2.0) + float32(offsetY)
+
+	return screenX, screenY
+}
+
+func (m *TileMapWidget) CreateRenderer() fyne.WidgetRenderer {
+	return &tileMapRenderer{
+		mapWidget:     m,
+		canvasTiles:   make(map[TileCoord]*canvas.Image),
+		canvasMarkers: make(map[*MapMarker]fyne.CanvasObject),
+	}
 }
 
 func (m *TileMapWidget) Destroy() {
@@ -81,11 +142,11 @@ func (m *TileMapWidget) Destroy() {
 }
 
 func (m *TileMapWidget) Dragged(e *fyne.DragEvent) {
-	m.mu.Lock()
+	m.mu.RLock()
 	currentZoom := m.zoom
 	currentLat := m.centerLat
 	currentLon := m.centerLon
-	m.mu.Unlock()
+	m.mu.RUnlock()
 
 	centerX, centerY := latLonToTileXY(currentLat, currentLon, currentZoom)
 
@@ -117,44 +178,58 @@ func tileXYToLatLon(xtile, ytile float64, zoom int) (lat, lon float64) {
 }
 
 func (m *TileMapWidget) Scrolled(e *fyne.ScrollEvent) {
-	dx := e.Scrolled.DX
 	dy := e.Scrolled.DY
-	log.Printf("--- Scrolled method entered! Scrolled.DX: %.2f, Scrolled.DY: %.2f ---", dx, dy)
-
 	if dy == 0 {
-		log.Println("Scroll event received, but Scrolled.DY is zero. No zoom change.")
 		return
 	}
 
 	m.mu.Lock()
-	oldZoom := m.zoom
+	// oldZoom := m.zoom
 	zoomChanged := false
 
-	if dy < 0 {
+	if dy < 0 { // Zoom in
 		if m.zoom < maxZoom {
 			m.zoom++
 			zoomChanged = true
-			log.Println("Scroll Zoom In Attempt -> Zoom", m.zoom)
-		} else {
-			log.Println("Scroll Zoom In Attempt -> Already at max zoom", maxZoom)
+			log.Println("Zoom In -> Zoom", m.zoom)
 		}
-	} else if dy > 0 {
+	} else { // Zoom out
 		if m.zoom > minZoom {
 			m.zoom--
 			zoomChanged = true
-			log.Println("Scroll Zoom Out Attempt -> Zoom", m.zoom)
-		} else {
-			log.Println("Scroll Zoom Out Attempt -> Already at min zoom", minZoom)
+			log.Println("Zoom Out -> Zoom", m.zoom)
 		}
 	}
-
 	m.mu.Unlock()
 
 	if zoomChanged {
-		log.Printf("Zoom changed from %d to %d. Refreshing.", oldZoom, m.zoom)
 		m.Refresh()
-	} else {
-		log.Printf("Zoom unchanged (%d) or at limit. No refresh triggered by scroll.", m.zoom)
+	}
+}
+
+func (m *TileMapWidget) Tapped(e *fyne.PointEvent) {
+	m.mu.RLock()
+	markersToCheck := make([]*MapMarker, len(m.markers))
+	copy(markersToCheck, m.markers)
+	m.mu.RUnlock()
+
+	for _, marker := range markersToCheck {
+		markerX, markerY := m.latLonToScreenXY(marker.Lat, marker.Lon)
+
+		dx := e.Position.X - markerX
+		dy := e.Position.Y - markerY
+		distSq := dx*dx + dy*dy
+
+		if distSq <= (markerHitRadius * markerHitRadius) {
+			log.Printf("Tapped Marker: %s (%.4f, %.4f)", marker.Name, marker.Lat, marker.Lon)
+			if m.parentWindow != nil {
+				info := fmt.Sprintf("Marker: %s\nLat: %.6f\nLon: %.6f", marker.Name, marker.Lat, marker.Lon)
+				dialog.ShowInformation("Marker Info", info, m.parentWindow)
+			} else {
+				log.Println("Warning: Cannot show marker dialog, parent window reference is nil")
+			}
+			return
+		}
 	}
 }
 
@@ -168,10 +243,13 @@ func (m *TileMapWidget) clampView() {
 	}
 }
 
+// --- Renderer ---
+
 type tileMapRenderer struct {
-	mapWidget   *TileMapWidget
-	objects     []fyne.CanvasObject
-	canvasTiles map[TileCoord]*canvas.Image
+	mapWidget     *TileMapWidget
+	objects       []fyne.CanvasObject
+	canvasTiles   map[TileCoord]*canvas.Image
+	canvasMarkers map[*MapMarker]fyne.CanvasObject
 }
 
 func (r *tileMapRenderer) Layout(size fyne.Size) {
@@ -179,12 +257,15 @@ func (r *tileMapRenderer) Layout(size fyne.Size) {
 	r.mapWidget.width = size.Width
 	r.mapWidget.height = size.Height
 	r.mapWidget.mu.Unlock()
-	r.mapWidget.Refresh()
+	// Positioning is handled in Refresh
 }
-func (r *tileMapRenderer) MinSize() fyne.Size { return fyne.NewSize(tileSize, tileSize) }
+
+func (r *tileMapRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(tileSize, tileSize)
+}
 
 func (r *tileMapRenderer) Refresh() {
-	r.processTileResults()
+	r.processTileResults() // Handle completed fetches
 
 	r.mapWidget.mu.RLock()
 	zoom := r.mapWidget.zoom
@@ -192,17 +273,21 @@ func (r *tileMapRenderer) Refresh() {
 	centerLon := r.mapWidget.centerLon
 	width := r.mapWidget.width
 	height := r.mapWidget.height
+	currentMarkers := make([]*MapMarker, len(r.mapWidget.markers))
+	copy(currentMarkers, r.mapWidget.markers)
 	r.mapWidget.mu.RUnlock()
+
 	if width <= 0 || height <= 0 {
-		return
+		return // Avoid rendering in zero area
 	}
 
+	// --- Tiles ---
 	visibleTiles := r.calculateRequiredTiles(zoom, centerLat, centerLon, width, height)
-	currentObjects := make([]fyne.CanvasObject, 0, len(visibleTiles))
 	neededCoords := make([]TileCoord, 0, len(visibleTiles))
 	activeCanvasTiles := make(map[TileCoord]bool)
+	currentTileObjects := make([]fyne.CanvasObject, 0, len(visibleTiles))
 
-	r.mapWidget.mu.Lock()
+	r.mapWidget.mu.Lock() // Lock for cache/fetching maps access
 	for _, coord := range visibleTiles {
 		imgData, dataFound := r.mapWidget.imageDataCache[coord]
 		if dataFound {
@@ -210,8 +295,8 @@ func (r *tileMapRenderer) Refresh() {
 			if !canvasFound {
 				canvasImg = canvas.NewImageFromImage(imgData)
 				if canvasImg == nil {
-					log.Printf("Error creating canvas image from cached data for tile %v", coord)
-					delete(r.mapWidget.imageDataCache, coord)
+					log.Printf("Error: Failed to create canvas image from cached data for tile %v", coord)
+					delete(r.mapWidget.imageDataCache, coord) // Remove potentially bad data
 					continue
 				}
 				canvasImg.ScaleMode = canvas.ImageScaleFastest
@@ -222,7 +307,7 @@ func (r *tileMapRenderer) Refresh() {
 			posX, posY := r.calculateTilePosition(coord, zoom, centerLat, centerLon, width, height)
 			canvasImg.Move(fyne.NewPos(posX, posY))
 			canvasImg.Show()
-			currentObjects = append(currentObjects, canvasImg)
+			currentTileObjects = append(currentTileObjects, canvasImg)
 			activeCanvasTiles[coord] = true
 		} else {
 			if !r.mapWidget.tileFetching[coord] {
@@ -233,14 +318,60 @@ func (r *tileMapRenderer) Refresh() {
 	}
 	r.mapWidget.mu.Unlock()
 
+	// Cleanup unused tile canvas objects
 	for coord, img := range r.canvasTiles {
 		if !activeCanvasTiles[coord] {
 			img.Hide()
 			delete(r.canvasTiles, coord)
 		}
 	}
-	r.objects = currentObjects
 
+	// --- Markers ---
+	currentMarkerObjects := make([]fyne.CanvasObject, 0, len(currentMarkers))
+	activeCanvasMarkers := make(map[*MapMarker]bool)
+
+	for _, marker := range currentMarkers {
+		screenX, screenY := r.mapWidget.latLonToScreenXY(marker.Lat, marker.Lon)
+
+		// Optionally skip rendering if marker is way off-screen
+		// if screenX < -markerRadius || screenX > width+markerRadius || screenY < -markerRadius || screenY > height+markerRadius {
+		// 	if canvasObj, exists := r.canvasMarkers[marker]; exists {
+		// 		canvasObj.Hide()
+		// 	}
+		// 	continue
+		// }
+
+		canvasObj, exists := r.canvasMarkers[marker]
+		var circle *canvas.Circle
+
+		if !exists {
+			circle = canvas.NewCircle(markerColor)
+			circle.Resize(fyne.NewSize(markerRadius*2, markerRadius*2))
+			r.canvasMarkers[marker] = circle
+			canvasObj = circle
+		} else {
+			// Assuming it's always a circle if it exists
+			circle = canvasObj.(*canvas.Circle)
+		}
+
+		circle.Move(fyne.NewPos(screenX-markerRadius, screenY-markerRadius))
+		circle.Show()
+		currentMarkerObjects = append(currentMarkerObjects, canvasObj)
+		activeCanvasMarkers[marker] = true
+	}
+
+	// Cleanup unused marker canvas objects
+	for marker, obj := range r.canvasMarkers {
+		if !activeCanvasMarkers[marker] {
+			obj.Hide()
+			delete(r.canvasMarkers, marker)
+		}
+	}
+
+	// Combine tiles and markers (markers on top)
+	r.objects = append(currentTileObjects, currentMarkerObjects...)
+
+	// Fetch needed tiles asynchronously
 	for _, coord := range neededCoords {
 		go r.fetchTileDataAsync(coord)
 	}
@@ -255,12 +386,23 @@ func (r *tileMapRenderer) processTileResults() {
 			r.mapWidget.mu.Lock()
 			delete(r.mapWidget.tileFetching, result.Coord)
 			if result.Error == nil && result.Image != nil {
-				r.mapWidget.imageDataCache[result.Coord] = result.Image
+				if result.Image.Bounds().Dx() > 0 && result.Image.Bounds().Dy() > 0 {
+					r.mapWidget.imageDataCache[result.Coord] = result.Image
+				} else {
+					log.Printf("Warning: Received invalid image for tile %v (zero dimensions)", result.Coord)
+				}
+			} else if result.Error != nil {
+				// Log fetch errors unless it's a common 404
+				if result.Error.Error() != "tile not found (404)" {
+					log.Printf("Error fetching tile %v: %v", result.Coord, result.Error)
+				}
 			} else {
-				log.Printf("Received error for tile %v from channel: %v", result.Coord, result.Error)
+				log.Printf("Warning: Received nil image and nil error for tile %v", result.Coord)
 			}
 			r.mapWidget.mu.Unlock()
+
 		default:
+			// No more results waiting
 			return
 		}
 	}
@@ -268,22 +410,32 @@ func (r *tileMapRenderer) processTileResults() {
 
 func (r *tileMapRenderer) calculateRequiredTiles(zoom int, lat, lon float64, w, h float32) []TileCoord {
 	centerX, centerY := latLonToTileXY(lat, lon, zoom)
-	tilesX := int(math.Ceil(float64(w)/tileSize)) + 2
-	tilesY := int(math.Ceil(float64(h)/tileSize)) + 2
+	tilesX := int(math.Ceil(float64(w)/tileSize)) + 2 // Buffer
+	tilesY := int(math.Ceil(float64(h)/tileSize)) + 2 // Buffer
+
 	startX := int(math.Floor(centerX - float64(tilesX)/2.0))
 	startY := int(math.Floor(centerY - float64(tilesY)/2.0))
+
 	tiles := make([]TileCoord, 0, tilesX*tilesY)
 	maxTile := int(math.Pow(2, float64(zoom))) - 1
+
 	for x := startX; x < startX+tilesX; x++ {
 		for y := startY; y < startY+tilesY; y++ {
-			wrappedX := x
-			if maxTile > 0 {
-				wrappedX = (x%(maxTile+1) + (maxTile + 1)) % (maxTile + 1)
-			} else {
-				wrappedX = 0
+			// Clamp Y coord
+			if y < 0 || y > maxTile {
+				continue
 			}
-			clampedY := clamp(y, 0, maxTile)
-			tiles = append(tiles, TileCoord{Z: zoom, X: wrappedX, Y: clampedY})
+
+			// Wrap X coord
+			wrappedX := x
+			if maxTile >= 0 {
+				nWrap := maxTile + 1
+				wrappedX = (x%nWrap + nWrap) % nWrap // Handles negative x
+			} else {
+				wrappedX = 0 // Zoom 0 case
+			}
+
+			tiles = append(tiles, TileCoord{Z: zoom, X: wrappedX, Y: y})
 		}
 	}
 	return tiles
@@ -291,73 +443,125 @@ func (r *tileMapRenderer) calculateRequiredTiles(zoom int, lat, lon float64, w, 
 
 func (r *tileMapRenderer) calculateTilePosition(coord TileCoord, zoom int, centerLat, centerLon float64, w, h float32) (float32, float32) {
 	n := math.Pow(2.0, float64(zoom))
+
 	centerPxX := ((centerLon + 180.0) / 360.0) * n * tileSize
 	centerPxY := (1.0 - math.Log(math.Tan(centerLat*math.Pi/180.0)+1.0/math.Cos(centerLat*math.Pi/180.0))/math.Pi) / 2.0 * n * tileSize
+
 	tilePxX := float64(coord.X) * tileSize
 	tilePxY := float64(coord.Y) * tileSize
+
 	offsetX := tilePxX - centerPxX
 	offsetY := tilePxY - centerPxY
+
 	screenX := (w / 2.0) + float32(offsetX)
 	screenY := (h / 2.0) + float32(offsetY)
+
 	return screenX, screenY
 }
 
 func (r *tileMapRenderer) fetchTileDataAsync(coord TileCoord) {
 	result := TileResult{Coord: coord}
+	fetchSuccessful := false
 
 	defer func() {
-		select {
-		case r.mapWidget.resultChan <- result:
-			if result.Error != nil {
-				log.Printf("Sent error for tile %v to channel: %v", coord, result.Error)
-				r.clearFetchingStatus(coord)
+		if !fetchSuccessful {
+			r.clearFetchingStatus(coord) // Ensure status is cleared on error/panic/cancellation
+		}
+		if rec := recover(); rec != nil {
+			log.Printf("Panic recovered in fetchTileDataAsync for %v: %v", coord, rec)
+			result.Error = fmt.Errorf("panic during fetch: %v", rec)
+			// Attempt to send error back, but don't block indefinitely
+			select {
+			case r.mapWidget.resultChan <- result:
+			case <-time.After(100 * time.Millisecond):
+			case <-r.mapWidget.stopChan:
 			}
-		case <-r.mapWidget.stopChan:
-			log.Printf("Widget destroyed, fetch cancelled for tile %v", coord)
-			r.clearFetchingStatus(coord)
-		case <-time.After(5 * time.Second):
-			log.Printf("Timeout sending result for tile %v to channel", coord)
-			r.clearFetchingStatus(coord)
 		}
 	}()
 
-	httpClient := &http.Client{Timeout: 20 * time.Second}
+	select {
+	case <-r.mapWidget.stopChan:
+		result.Error = fmt.Errorf("fetch cancelled")
+		// Do not send to channel here, defer handles status cleanup
+		return
+	default:
+		// Proceed with fetch
+	}
+
 	subdomainIndex := (coord.X + coord.Y) % len(cartoSubdomains)
 	subdomain := cartoSubdomains[subdomainIndex]
 	url := fmt.Sprintf("https://%s.basemaps.cartocdn.com/rastertiles/voyager/%d/%d/%d.png", subdomain, coord.Z, coord.X, coord.Y)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		result.Error = fmt.Errorf("creating request: %w", err)
+		result.Error = fmt.Errorf("creating request failed: %w", err)
+		r.sendResult(result)
 		return
 	}
 	req.Header.Set("User-Agent", yourUserAgent)
+
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+	defer cancel()
+	req = req.WithContext(ctx)
 
 	resp, err := httpClient.Do(req)
 	if resp != nil {
 		defer resp.Body.Close()
 	}
 	if err != nil {
-		result.Error = fmt.Errorf("http do: %w", err)
+		if ctx.Err() == context.DeadlineExceeded {
+			result.Error = fmt.Errorf("http timeout for %s", url)
+		} else if ctx.Err() == context.Canceled {
+			result.Error = fmt.Errorf("http request cancelled")
+		} else {
+			result.Error = fmt.Errorf("http request failed for %s: %w", url, err)
+		}
+		r.sendResult(result)
 		return
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
 		result.Error = fmt.Errorf("tile not found (404)")
+		r.sendResult(result)
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		result.Error = fmt.Errorf("http status %s", resp.Status)
+		result.Error = fmt.Errorf("http status %s for %s", resp.Status, url)
+		r.sendResult(result)
 		return
 	}
 
 	imgData, err := png.Decode(resp.Body)
 	if err != nil {
-		result.Error = fmt.Errorf("decoding png: %w", err)
+		result.Error = fmt.Errorf("decoding png failed for %s: %w", url, err)
+		r.sendResult(result)
+		return
+	}
+
+	if imgData == nil || imgData.Bounds().Dx() <= 0 || imgData.Bounds().Dy() <= 0 {
+		result.Error = fmt.Errorf("decoded image invalid (nil or zero size) for %s", url)
+		r.sendResult(result)
 		return
 	}
 
 	result.Image = imgData
+	fetchSuccessful = true // Mark success before sending
+	r.sendResult(result)
+}
+
+func (r *tileMapRenderer) sendResult(result TileResult) {
+	select {
+	case r.mapWidget.resultChan <- result:
+		// Successfully sent
+	case <-r.mapWidget.stopChan:
+		log.Printf("Sending cancelled for tile %v result (widget stopped)", result.Coord)
+	case <-time.After(sendTimeout):
+		log.Printf("Timeout sending result for tile %v to channel. Discarding.", result.Coord)
+		// If sending timed out, the fetch status might still be set.
+		// Clear it regardless of whether the fetch succeeded or failed,
+		// because the successful result was lost.
+		r.clearFetchingStatus(result.Coord)
+	}
 }
 
 func (r *tileMapRenderer) clearFetchingStatus(coord TileCoord) {
@@ -368,13 +572,17 @@ func (r *tileMapRenderer) clearFetchingStatus(coord TileCoord) {
 
 func (r *tileMapRenderer) Objects() []fyne.CanvasObject {
 	r.mapWidget.mu.RLock()
-	defer r.mapWidget.mu.RUnlock()
+	// Return a shallow copy for safety
 	objs := make([]fyne.CanvasObject, len(r.objects))
 	copy(objs, r.objects)
+	r.mapWidget.mu.RUnlock()
 	return objs
 }
 
-func (r *tileMapRenderer) Destroy() {}
+func (r *tileMapRenderer) Destroy() {
+	// Cleanup resources if needed, though Fyne handles CanvasObjects
+	log.Println("TileMapRenderer Destroy called")
+}
 
 func latLonToTileXY(lat, lon float64, zoom int) (float64, float64) {
 	latRad := lat * math.Pi / 180.0
@@ -384,42 +592,40 @@ func latLonToTileXY(lat, lon float64, zoom int) (float64, float64) {
 	return xtile, ytile
 }
 
-func clamp(value, min, max int) int {
-	if value < min {
-		return min
-	}
-	if value > max {
-		return max
-	}
-	return value
-}
+// --- Main Application ---
 
 func main() {
 	myApp := app.New()
 	myApp.Settings().SetTheme(theme.DarkTheme())
 
-	startZoom := 5
-	startLat := 10.0
-	startLon := 110.0
-	mapWidget := NewTileMapWidget(startZoom, startLat, startLon)
+	myWindow := myApp.NewWindow("Fyne Carto Map with Clickable Marker")
+
+	startZoom := 12
+	startLat := 10.7769  // Ho Chi Minh City Latitude
+	startLon := 106.7009 // Ho Chi Minh City Longitude
+
+	mapWidget := NewTileMapWidget(startZoom, startLat, startLon, myWindow)
+
+	hcmcMarker := &MapMarker{
+		Lat:  startLat,
+		Lon:  startLon,
+		Name: "Ho Chi Minh City",
+		ID:   "HCMC",
+	}
+	mapWidget.AddMarker(hcmcMarker)
+	log.Println("Added Ho Chi Minh City marker.")
 
 	attributionLabel := widget.NewLabel("© OpenStreetMap contributors, © CARTO")
 	attributionLabel.Alignment = fyne.TextAlignTrailing
 	attributionLabel.TextStyle = fyne.TextStyle{Italic: true}
-	scrollContainer := container.NewScroll(mapWidget)
-	mapArea := container.NewMax(scrollContainer)
+
+	mapArea := container.NewMax(mapWidget) // Map fills the available space
 	content := container.NewBorder(nil, container.NewPadded(attributionLabel), nil, nil, mapArea)
 
-	myWindow := myApp.NewWindow("Fyne Carto Map (Pure Go - Channel Fix)")
-	if drv, ok := myApp.Driver().(desktop.Driver); ok {
-		log.Println("Driver is desktop. Calling SetMaster().")
-		myWindow.SetMaster()
-		_ = drv
-	} else {
-		log.Println("Driver is NOT desktop.")
-	}
 	myWindow.SetContent(content)
 	myWindow.Resize(fyne.NewSize(900, 700))
 	myWindow.CenterOnScreen()
 	myWindow.ShowAndRun()
+
+	log.Println("Application exiting.")
 }
