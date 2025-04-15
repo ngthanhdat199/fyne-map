@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"image"
-	"image/color"
 	"image/png"
 	"log"
 	"math"
@@ -31,12 +30,15 @@ const (
 	markerHitRadius = 10.0 // Pixel radius for click detection
 	fetchTimeout    = 15 * time.Second
 	sendTimeout     = 5 * time.Second
+	mapTileSize     = 256 // Tile size expected
+
+	mapboxUsername    = "thanhdat19"
+	mapboxStyleID     = "cm9is30la00sx01qua6xa2b7s"
+	mapboxAccessToken = "pk.eyJ1IjoidGhhbmhkYXQxOSIsImEiOiJjbTlpcHgycXgwMjcwMmpxMTRybXczamMwIn0.NLpIdFMutAPECag8yVaERA" // WARNING: Consider loading from config/env
 )
 
 var (
-	cartoSubdomains = []string{"a", "b", "c", "d"}
-	markerColor     = color.NRGBA{R: 0, G: 0, B: 255, A: 255} // Blue
-	httpClient      = &http.Client{Timeout: fetchTimeout}
+	httpClient = &http.Client{Timeout: fetchTimeout}
 )
 
 type TileCoord struct {
@@ -500,9 +502,17 @@ func (r *tileMapRenderer) fetchTileDataAsync(coord TileCoord) {
 		// Proceed with fetch
 	}
 
-	subdomainIndex := (coord.X + coord.Y) % len(cartoSubdomains)
-	subdomain := cartoSubdomains[subdomainIndex]
-	url := fmt.Sprintf("https://%s.basemaps.cartocdn.com/rastertiles/voyager/%d/%d/%d.png", subdomain, coord.Z, coord.X, coord.Y)
+	url := fmt.Sprintf("https://api.mapbox.com/styles/v1/%s/%s/tiles/%d/%d/%d/%d?access_token=%s",
+		mapboxUsername,
+		mapboxStyleID,
+		mapTileSize, // Use constant for tile size (e.g., 256)
+		coord.Z,
+		coord.X,
+		coord.Y,
+		mapboxAccessToken,
+	)
+
+	fmt.Println("Fetching tile:", url)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
