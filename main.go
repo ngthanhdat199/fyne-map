@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	minZoom         = 0
+	minZoom         = 8
 	maxZoom         = 18
 	tileSize        = 256
 	tileResultBuf   = 64
