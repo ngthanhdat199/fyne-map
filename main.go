@@ -89,12 +89,24 @@ func NewTileMapWidget(startZoom int, startLat, startLon float64, parentWin fyne.
 	return m
 }
 
-func (m *TileMapWidget) AddMarker(marker *MapMarker) {
-	if marker == nil {
+func (m *TileMapWidget) AddMarkers(newMarkers ...*MapMarker) {
+	if len(newMarkers) == 0 {
 		return
 	}
+
+	validMarkers := make([]*MapMarker, 0, len(newMarkers))
+	for _, marker := range newMarkers {
+		if marker != nil {
+			validMarkers = append(validMarkers, marker)
+		}
+	}
+
+	if len(validMarkers) == 0 {
+		return
+	}
+
 	m.mu.Lock()
-	m.markers = append(m.markers, marker)
+	m.markers = append(m.markers, validMarkers...)
 	m.mu.Unlock()
 	m.Refresh()
 }
@@ -612,14 +624,22 @@ func main() {
 		Name: "Ho Chi Minh City",
 		ID:   "HCMC",
 	}
-	mapWidget.AddMarker(hcmcMarker)
-	log.Println("Added Ho Chi Minh City marker.")
+	nearbyMarker := &MapMarker{
+		Lat:  startLat + 0.02,
+		Lon:  startLon + 0.01,
+		Name: "Nearby Place",
+		ID:   "NEARBY",
+	}
+
+	mapWidget.AddMarkers(hcmcMarker, nearbyMarker)
+
+	log.Println("Added multiple markers.")
 
 	attributionLabel := widget.NewLabel("© OpenStreetMap contributors, © CARTO")
 	attributionLabel.Alignment = fyne.TextAlignTrailing
 	attributionLabel.TextStyle = fyne.TextStyle{Italic: true}
 
-	mapArea := container.NewMax(mapWidget) // Map fills the available space
+	mapArea := container.NewStack(mapWidget)
 	content := container.NewBorder(nil, container.NewPadded(attributionLabel), nil, nil, mapArea)
 
 	myWindow.SetContent(content)
